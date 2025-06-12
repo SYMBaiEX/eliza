@@ -10,7 +10,7 @@ import { logger } from '@elizaos/core';
  */
 export async function getAvailableDiskSpace(): Promise<number> {
   try {
-    const result = await execa('df', ['-k', require('node:os').tmpdir()]);
+    const result = await execa('df', ['-k', tmpdir()]);
     const lines = result.stdout.split('\n');
     const dataLine = lines[1]; // Second line contains the data
     const parts = dataLine.split(/\s+/);
