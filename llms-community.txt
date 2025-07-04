@@ -864,7 +864,7 @@ Idk about you, but I hate seeing questions left hanging in tech support channels
 
 While we're analyzing tech support channels, we can identify gaps in docs based on common community questions which can then be addressed systematically. This may involve checking if any github issues or pull requests already address a question, and if not, then to help create an issue for it. Herein lies a powerful feedback loop:
 
-- Aggregate & Analyze: Extract questions and answers, who is helping who (and if succesful), identify pain points, gather sentiment
+- Aggregate & Analyze: Extract questions and answers, who is helping who (and if successful), identify pain points, gather sentiment
 - Clean & Enhance Data, Update docs, create bug reports
 - RAG Knowledge: AI Agents giving automated responses to FAQ
 
@@ -1139,7 +1139,7 @@ The WDYGDTW series played a role in establishing momentum and maintaining it thr
 
 ## Timeline
 
-We transcribed, summarized, and uplaoded notes for every Space shortly after each one. However, until now the recordings and notes haven't all been easily accessible all in one place. Showing up is half the battle. These are the pioneers of a grassroots crypto / AI movement.
+We transcribed, summarized, and uploaded notes for every Space shortly after each one. However, until now the recordings and notes haven't all been easily accessible all in one place. Showing up is half the battle. These are the pioneers of a grassroots crypto / AI movement.
 
 ```
 - Nov 15, 2024
@@ -13739,7 +13739,7 @@ The plugin requires environment variables or runtime settings:
 ```env
 MVX_PRIVATE_KEY=your-wallet-private-key
 MVX_NETWORK=devnet  # mainnet, devnet, or testnet
-ACCESS_TOKEN_MANAGEMENT_TO=everyone  # you can put an userid to limit token managament to one user only
+ACCESS_TOKEN_MANAGEMENT_TO=everyone  # you can put an userid to limit token management to one user only
 ```
 
 ## Integration
@@ -16106,9 +16106,10 @@ npm install @elizaos/plugin-twitter
 Requires environment variables:
 
 ```env
-TWITTER_USERNAME=your_username
-TWITTER_PASSWORD=your_password
-TWITTER_EMAIL=your_email              # Optional: for 2FA
+TWITTER_API_KEY=your_api_key
+TWITTER_API_SECRET_KEY=your_api_secret_key
+TWITTER_ACCESS_TOKEN=your_access_token
+TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret
 TWITTER_2FA_SECRET=your_2fa_secret    # Optional: for 2FA
 TWITTER_PREMIUM=false                 # Optional: enables premium features
 TWITTER_DRY_RUN=false                # Optional: test without posting
@@ -18665,7 +18666,7 @@ This plugin provides advanced functionality for the Flow Blockchain.
 - Accounts management based on Account Linking feature
 - Token Price Query for any token on Flow Blockchain
 - Token Transfer from User's account to others' address
-- Token Registeration for any token on Flow Blockchain
+- Token Registration for any token on Flow Blockchain
 
 ## Installation
 

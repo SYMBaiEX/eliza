@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunk_elizaos_docs=self.webpackChunk_elizaos_docs||[]).push([[56496],{56496:(e,s,c)=>{c.d(s,{createArchitectureServices:()=>a.S});var a=c(89062);c(50429)}}]);
