@@ -58,10 +58,6 @@ export const baseOptions: BaseLayoutProps = {
       url: '/docs/technical',
     },
     {
-      text: 'API Reference',
-      url: '/docs/technical/api-reference',
-    },
-    {
       text: 'GitHub',
       url: 'https://github.com/elizaos/eliza',
       external: true,
