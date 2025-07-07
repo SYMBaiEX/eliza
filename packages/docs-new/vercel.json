@@ -1,0 +1,11 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "bun run build",
+  "devCommand": "bun run dev",
+  "installCommand": "bun install",
+  "functions": {
+    "app/api/search/route.ts": {
+      "runtime": "nodejs20.x"
+    }
+  }
+}
