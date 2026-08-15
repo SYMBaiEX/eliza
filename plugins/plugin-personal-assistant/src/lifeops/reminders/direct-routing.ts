@@ -29,9 +29,13 @@ const REMINDER_RECALL =
 const THIRD_PARTY_REMINDER =
   /\bremind\s+(?!me\b|myself\b)(?:him|her|them|us|my\b|[A-Za-z][\p{L}'’-]*)\b/iu;
 const MIXED_RECIPIENT_REMINDER =
-  /\bremind\s+(?:me|myself)(?:\s+(?:and|&|plus)\s+(?!me\b|myself\b)[\p{L}]|\s*,\s*[\p{Lu}][\p{L}'’-]*(?:\s*,|\s+(?:and|&|to)\b))/iu;
+  /\bremind\s+(?:me|myself)\b(?:\s*,?\s*(?:and|&|plus|as\s+well\s+as)\s+(?:<@!?\d+>|@[^\s,;]+|\d+\b|[\p{L}][\p{L}'’-]*\b)|\s*,\s*[\p{Lu}][\p{L}'’-]*(?=\s*(?:,|and\b)))/iu;
 const QUOTED_REMINDER =
   /["“”‘’`]([^"“”‘’`]*\b(?:remind\s+(?:me|myself)|add\s+(?:an?\s+)?reminder|create\s+(?:an?\s+)?reminder|set\s+(?:an?\s+)?reminder|schedule\s+(?:an?\s+)?reminder)\b[^"“”‘’`]*)["“”‘’`]/iu;
+const REPORTED_OR_INSCRIBED_REMINDER =
+  /\bremind\s+(?:me|myself)\b[\s\S]{0,160}(?:,\s*(?:said|asked|wrote|reported)\b|\b(?:was|is)\s+(?:written|inscribed|printed|posted|displayed|shown|scribbled)\b)/iu;
+const SAME_TURN_REMINDER_RESCISSION =
+  /\bremind\s+(?:me|myself)\b[\s\S]{0,180}(?:[;—.!?]\s*|\b(?:but|actually)\s+)(?:please\s+)?(?:disregard|ignore|withdraw|cancel|scratch|never\s+mind|nevermind)\b/iu;
 
 export function looksLikeOwnerReminderCreateRequest(text: string): boolean {
   const normalized = text.trim();
@@ -46,6 +50,8 @@ export function looksLikeOwnerReminderCreateRequest(text: string): boolean {
     !THIRD_PARTY_REMINDER.test(normalized) &&
     !MIXED_RECIPIENT_REMINDER.test(normalized) &&
     !QUOTED_REMINDER.test(normalized) &&
+    !REPORTED_OR_INSCRIBED_REMINDER.test(normalized) &&
+    !SAME_TURN_REMINDER_RESCISSION.test(normalized) &&
     REMINDER_CREATE_PATTERNS.some((pattern) => pattern.test(directRequest))
   );
 }
