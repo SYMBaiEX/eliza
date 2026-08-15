@@ -116,4 +116,49 @@ describe("Shared reminder cron", () => {
     );
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
+
+  for (const status of [403, 429]) {
+    test(`does not record a reminder fired after an explicit ${status} rejection`, async () => {
+      globalThis.fetch = mock(async () =>
+        Response.json(
+          {
+            success: false,
+            acceptance: "not_accepted",
+            retryable: true,
+          },
+          { status },
+        ),
+      ) as typeof fetch;
+
+      await expect(processDueSharedReminders(env)).resolves.toEqual({
+        scanned: 1,
+        fired: 0,
+        raced: 0,
+        deferred: 1,
+        failed: 0,
+      });
+    });
+  }
+
+  test("does not record an indeterminate provider receipt as fired", async () => {
+    globalThis.fetch = mock(async () =>
+      Response.json(
+        {
+          success: false,
+          acceptance: "unknown",
+          acceptanceUnknown: true,
+          retryable: false,
+        },
+        { status: 202 },
+      ),
+    ) as typeof fetch;
+
+    await expect(processDueSharedReminders(env)).resolves.toEqual({
+      scanned: 1,
+      fired: 0,
+      raced: 0,
+      deferred: 1,
+      failed: 0,
+    });
+  });
 });

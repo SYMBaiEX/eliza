@@ -5,6 +5,10 @@
  * early or lose the working Shared fallback on failure.
  */
 
+import {
+  createSharedTodoCutoverSnapshot,
+  type SharedTodoCutoverSnapshot,
+} from "@elizaos/shared/todo-cutover";
 import { Hono } from "hono";
 import { z } from "zod";
 import { usersRepository } from "@/db/repositories/users";
@@ -28,9 +32,12 @@ import {
 } from "@/lib/services/shared-runtime/personal-shared-agent";
 import {
   commitSharedReminderCutover,
+  releaseSharedReminderCutover,
   reserveSharedRemindersForCutover,
+  SHARED_CUTOVER_GATEWAY_CHANNEL,
   SharedReminderCutoverConflictError,
 } from "@/lib/services/shared-runtime/shared-scheduling";
+import { readSharedTodoCutoverState } from "@/lib/services/shared-runtime/shared-todos";
 import type { AppEnv } from "@/types/cloud-worker-env";
 
 const CORS_METHODS = "POST, OPTIONS";
@@ -39,6 +46,40 @@ const bodySchema = z.object({ dedicatedAgentId: z.string().uuid() });
 
 function json(body: unknown, status = 200): Response {
   return applyCorsHeaders(Response.json(body, { status }), CORS_METHODS);
+}
+
+function prepareRemindersForDedicated(
+  tasks: Awaited<ReturnType<typeof reserveSharedRemindersForCutover>>,
+) {
+  return tasks.map((task) => ({
+    ...task,
+    escalation: {
+      ...(task.escalation ?? {}),
+      steps: (
+        task.escalation?.steps ?? [
+          { delayMinutes: 0, channelKey: SHARED_CUTOVER_GATEWAY_CHANNEL },
+        ]
+      ).map((step) => ({
+        ...step,
+        channelKey: SHARED_CUTOVER_GATEWAY_CHANNEL,
+      })),
+    },
+    output: task.output
+      ? { ...task.output, target: SHARED_CUTOVER_GATEWAY_CHANNEL }
+      : task.output,
+  }));
+}
+
+function scheduledTaskSnapshotsMatch(
+  left: Awaited<ReturnType<typeof reserveSharedRemindersForCutover>>,
+  right: Awaited<ReturnType<typeof reserveSharedRemindersForCutover>>,
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (task, index) => JSON.stringify(task) === JSON.stringify(right[index]),
+    )
+  );
 }
 
 async function readJsonBody(request: Request): Promise<unknown> {
@@ -86,6 +127,88 @@ async function postDedicatedImport(
         ? (parsed as Record<string, unknown>)
         : null,
   };
+}
+
+async function readTodoCutoverSnapshot(
+  sourceAgentId: string,
+  ownerId: string,
+): Promise<SharedTodoCutoverSnapshot> {
+  const state = await readSharedTodoCutoverState({ sourceAgentId, ownerId });
+  return createSharedTodoCutoverSnapshot({
+    sourceAgentId,
+    todos: state.todos.map((todo) => ({
+      sourceId: todo.id,
+      roomId: todo.roomId,
+      worldId: todo.worldId,
+      content: todo.content,
+      activeForm: todo.activeForm,
+      status: todo.status,
+      parentSourceId: todo.parentTodoId,
+      parentTrajectoryStepId: todo.parentTrajectoryStepId,
+      metadata: todo.metadata,
+      createdAt: todo.createdAt.toISOString(),
+      updatedAt: todo.updatedAt.toISOString(),
+      completedAt: todo.completedAt?.toISOString() ?? null,
+    })),
+    mutations: state.mutations,
+  });
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function confirmsTodoImport(
+  receipt: Record<string, unknown> | null,
+  snapshot: SharedTodoCutoverSnapshot,
+): boolean {
+  return (
+    receipt?.sourceTodoCount === snapshot.todos.length &&
+    receipt.sourceTodoMutationCount === snapshot.mutations.length &&
+    isNonNegativeSafeInteger(receipt.importedTodos) &&
+    isNonNegativeSafeInteger(receipt.repairedTodos) &&
+    isNonNegativeSafeInteger(receipt.skippedTodos) &&
+    isNonNegativeSafeInteger(receipt.removedStaleTodos) &&
+    receipt.importedTodos + receipt.repairedTodos + receipt.skippedTodos ===
+      snapshot.todos.length &&
+    isNonNegativeSafeInteger(receipt.importedTodoMutations) &&
+    isNonNegativeSafeInteger(receipt.skippedTodoMutations) &&
+    receipt.importedTodoMutations + receipt.skippedTodoMutations ===
+      snapshot.mutations.length &&
+    receipt.sourceTodoDigest === snapshot.digest &&
+    receipt.targetTodoDigest === snapshot.digest
+  );
+}
+
+function confirmsPersonalImport(
+  receipt: Record<string, unknown> | null,
+  expectedMessageCount: number,
+  expectedScheduledTaskCount: number,
+  todoSnapshot: SharedTodoCutoverSnapshot,
+  requireActivation: boolean,
+): boolean {
+  if (
+    receipt?.complete !== true ||
+    receipt.sourceMessageCount !== expectedMessageCount ||
+    !isNonNegativeSafeInteger(receipt.inserted) ||
+    !isNonNegativeSafeInteger(receipt.skipped) ||
+    receipt.inserted + receipt.skipped !== expectedMessageCount ||
+    receipt.sourceScheduledTaskCount !== expectedScheduledTaskCount ||
+    !isNonNegativeSafeInteger(receipt.importedScheduledTasks) ||
+    !isNonNegativeSafeInteger(receipt.skippedScheduledTasks) ||
+    receipt.importedScheduledTasks + receipt.skippedScheduledTasks !==
+      expectedScheduledTaskCount ||
+    !confirmsTodoImport(receipt, todoSnapshot)
+  ) {
+    return false;
+  }
+  if (!requireActivation) return true;
+  return (
+    isNonNegativeSafeInteger(receipt.activatedScheduledTasks) &&
+    isNonNegativeSafeInteger(receipt.skippedActivatedScheduledTasks) &&
+    receipt.activatedScheduledTasks + receipt.skippedActivatedScheduledTasks ===
+      expectedScheduledTaskCount
+  );
 }
 
 const app = new Hono<AppEnv>();
@@ -149,6 +272,7 @@ app.post("/", async (c) => {
       );
     }
     const sealToken = `personal-cutover:${sourceAgentId}:${parsed.data.dedicatedAgentId}`;
+    const reminderReservationToken = `${sealToken}:reminders:${crypto.randomUUID()}`;
     const authorization = c.req.header("authorization");
     const apiKey = c.req.header("x-api-key");
     const active = await findActivePersonalDedicatedTarget(
@@ -166,7 +290,18 @@ app.post("/", async (c) => {
         active,
         c.env.ELIZA_CLOUD_AGENT_BASE_DOMAIN,
       );
-      if (marker?.cutoverToken === sealToken && activeBase) {
+      const activeTodoSnapshot = await readTodoCutoverSnapshot(
+        sourceAgentId,
+        user.id,
+      );
+      if (
+        marker?.cutoverToken === sealToken &&
+        marker.sharedTodoCount === activeTodoSnapshot.todos.length &&
+        marker.sharedTodoMutationCount ===
+          activeTodoSnapshot.mutations.length &&
+        marker.sharedTodoDigest === activeTodoSnapshot.digest &&
+        activeBase
+      ) {
         try {
           await coordinateSharedCutoverCommit(
             sourceAgentId,
@@ -178,12 +313,15 @@ app.post("/", async (c) => {
             sourceAgentId,
             targetAgentId: active.id,
             token: sealToken,
+            holderToken: reminderReservationToken,
+            authoritative: true,
           });
           const activation = await postDedicatedImport(
             `${activeBase}/api/conversations/${encodeURIComponent(sourceAgentId)}/import`,
             {
               messages: [],
-              scheduledTasks,
+              scheduledTasks: prepareRemindersForDedicated(scheduledTasks),
+              todoSnapshot: activeTodoSnapshot,
               cutoverToken: sealToken,
               activateScheduledTasks: true,
             },
@@ -192,23 +330,23 @@ app.post("/", async (c) => {
           );
           if (
             !activation.response.ok ||
-            activation.receipt?.sourceScheduledTaskCount !==
-              scheduledTasks.length ||
-            typeof activation.receipt.activatedScheduledTasks !== "number" ||
-            typeof activation.receipt.skippedActivatedScheduledTasks !==
-              "number" ||
-            activation.receipt.activatedScheduledTasks +
-              activation.receipt.skippedActivatedScheduledTasks !==
-              scheduledTasks.length
+            !confirmsPersonalImport(
+              activation.receipt,
+              0,
+              scheduledTasks.length,
+              activeTodoSnapshot,
+              true,
+            )
           ) {
             throw new Error(
-              "Dedicated did not confirm reminder activation for the committed cutover",
+              "Dedicated did not confirm personal-data activation for the committed cutover",
             );
           }
           await commitSharedReminderCutover({
             sourceAgentId,
             targetAgentId: active.id,
             token: sealToken,
+            holderToken: reminderReservationToken,
             expectedTaskCount: marker.sharedScheduledTaskCount,
           });
           return json({
@@ -220,6 +358,8 @@ app.post("/", async (c) => {
               apiBase: activeBase,
               importedMessages: marker.sharedMessageCount,
               importedScheduledTasks: marker.sharedScheduledTaskCount,
+              importedTodos: marker.sharedTodoCount,
+              importedTodoMutations: marker.sharedTodoMutationCount,
             },
           });
         } catch {
@@ -276,6 +416,7 @@ app.post("/", async (c) => {
       { namespace: conversationNamespace },
     );
     let markerCommitted = false;
+    let remindersReserved = false;
     try {
       if (history.some((message) => !message.id)) {
         return json(
@@ -296,7 +437,9 @@ app.post("/", async (c) => {
           sourceAgentId,
           targetAgentId: target.id,
           token: sealToken,
+          holderToken: reminderReservationToken,
         });
+        remindersReserved = true;
       } catch (error) {
         // error-policy:J1 the cutover boundary translates an ownership conflict for retry.
         if (error instanceof SharedReminderCutoverConflictError) {
@@ -313,6 +456,7 @@ app.post("/", async (c) => {
         throw error;
       }
       const importUrl = `${base}/api/conversations/${encodeURIComponent(sourceAgentId)}/import`;
+      let todoSnapshot = await readTodoCutoverSnapshot(sourceAgentId, user.id);
       const importedMessages = history.map((message) => ({
         sourceId: message.id,
         role: message.role,
@@ -326,7 +470,8 @@ app.post("/", async (c) => {
           importUrl,
           {
             messages: importedMessages,
-            scheduledTasks,
+            scheduledTasks: prepareRemindersForDedicated(scheduledTasks),
+            todoSnapshot,
             cutoverToken: sealToken,
           },
           authorization,
@@ -338,30 +483,27 @@ app.post("/", async (c) => {
               success: false,
               code: "dedicated_history_import_failed",
               error:
-                "History and reminders did not finish moving to Dedicated. Shared remains active.",
+                "History, reminders, and Todos did not finish moving to Dedicated. Shared remains active.",
             },
             503,
           );
         }
         const receipt = imported.receipt;
         if (
-          receipt?.complete !== true ||
-          receipt.sourceMessageCount !== history.length ||
-          typeof receipt.inserted !== "number" ||
-          typeof receipt.skipped !== "number" ||
-          receipt.inserted + receipt.skipped !== history.length ||
-          receipt.sourceScheduledTaskCount !== scheduledTasks.length ||
-          typeof receipt.importedScheduledTasks !== "number" ||
-          typeof receipt.skippedScheduledTasks !== "number" ||
-          receipt.importedScheduledTasks + receipt.skippedScheduledTasks !==
-            scheduledTasks.length
+          !confirmsPersonalImport(
+            receipt,
+            history.length,
+            scheduledTasks.length,
+            todoSnapshot,
+            false,
+          )
         ) {
           return json(
             {
               success: false,
               code: "dedicated_history_receipt_invalid",
               error:
-                "Dedicated did not confirm the complete history and reminder import. Shared remains active.",
+                "Dedicated did not confirm the complete history, reminder, and Todo import. Shared remains active.",
             },
             503,
           );
@@ -370,12 +512,15 @@ app.post("/", async (c) => {
           sourceAgentId,
           targetAgentId: target.id,
           token: sealToken,
+          holderToken: reminderReservationToken,
         });
+        const refreshedTodoSnapshot = await readTodoCutoverSnapshot(
+          sourceAgentId,
+          user.id,
+        );
         if (
-          refreshedTasks.length === scheduledTasks.length &&
-          refreshedTasks.every(
-            (task, index) => task.taskId === scheduledTasks[index]?.taskId,
-          )
+          scheduledTaskSnapshotsMatch(refreshedTasks, scheduledTasks) &&
+          refreshedTodoSnapshot.digest === todoSnapshot.digest
         ) {
           break;
         }
@@ -383,14 +528,15 @@ app.post("/", async (c) => {
           return json(
             {
               success: false,
-              code: "shared_reminder_snapshot_unstable",
+              code: "shared_personal_snapshot_unstable",
               error:
-                "Shared reminders are still settling. Try Dedicated activation again.",
+                "Shared personal data is still settling. Try Dedicated activation again.",
             },
             409,
           );
         }
         scheduledTasks = refreshedTasks;
+        todoSnapshot = refreshedTodoSnapshot;
       }
 
       const activeTarget = await finalizePersonalTierUpgradeCutover({
@@ -401,6 +547,9 @@ app.post("/", async (c) => {
         cutoverToken: sealToken,
         sharedMessageCount: history.length,
         sharedScheduledTaskCount: scheduledTasks.length,
+        sharedTodoCount: todoSnapshot.todos.length,
+        sharedTodoMutationCount: todoSnapshot.mutations.length,
+        sharedTodoDigest: todoSnapshot.digest,
       });
       markerCommitted = true;
       await coordinateSharedCutoverCommit(
@@ -413,7 +562,8 @@ app.post("/", async (c) => {
         importUrl,
         {
           messages: importedMessages,
-          scheduledTasks,
+          scheduledTasks: prepareRemindersForDedicated(scheduledTasks),
+          todoSnapshot,
           cutoverToken: sealToken,
           activateScheduledTasks: true,
         },
@@ -422,20 +572,20 @@ app.post("/", async (c) => {
       );
       if (
         !activation.response.ok ||
-        activation.receipt?.sourceScheduledTaskCount !==
-          scheduledTasks.length ||
-        typeof activation.receipt.activatedScheduledTasks !== "number" ||
-        typeof activation.receipt.skippedActivatedScheduledTasks !== "number" ||
-        activation.receipt.activatedScheduledTasks +
-          activation.receipt.skippedActivatedScheduledTasks !==
-          scheduledTasks.length
+        !confirmsPersonalImport(
+          activation.receipt,
+          history.length,
+          scheduledTasks.length,
+          todoSnapshot,
+          true,
+        )
       ) {
         return json(
           {
             success: false,
             code: "dedicated_reminder_activation_failed",
             error:
-              "Dedicated did not activate the imported reminders. Retry cutover to repair them.",
+              "Dedicated did not confirm the imported reminders and Todos. Retry cutover to repair them.",
           },
           503,
         );
@@ -444,6 +594,7 @@ app.post("/", async (c) => {
         sourceAgentId,
         targetAgentId: target.id,
         token: sealToken,
+        holderToken: reminderReservationToken,
         expectedTaskCount: scheduledTasks.length,
       });
       return json({
@@ -455,10 +606,20 @@ app.post("/", async (c) => {
           apiBase: base,
           importedMessages: history.length,
           importedScheduledTasks: scheduledTasks.length,
+          importedTodos: todoSnapshot.todos.length,
+          importedTodoMutations: todoSnapshot.mutations.length,
         },
       });
     } finally {
       if (!markerCommitted) {
+        if (remindersReserved) {
+          await releaseSharedReminderCutover({
+            sourceAgentId,
+            targetAgentId: target.id,
+            token: sealToken,
+            holderToken: reminderReservationToken,
+          });
+        }
         await coordinateSharedCutoverRelease(
           sourceAgentId,
           sourceAgentId,

@@ -18,12 +18,16 @@ import {
   type ScheduledTaskDispatcher,
 } from "@elizaos/plugin-scheduling/edge";
 
+export { SHARED_CUTOVER_GATEWAY_CHANNEL } from "@elizaos/plugin-scheduling/edge";
+
 export class SharedReminderCutoverConflictError extends Error {
   constructor(readonly activeToken: string) {
     super("Shared reminders are already reserved by another Dedicated cutover");
     this.name = "SharedReminderCutoverConflictError";
   }
 }
+
+const SHARED_REMINDER_RESERVATION_LEASE_MS = 60_000;
 
 export async function executeSharedSchedulingSql(
   sqlText: string,
@@ -70,6 +74,28 @@ export function createSharedScheduledTaskRunner(
   });
 }
 
+/** Resolve only the source-owned reminder committed to one Dedicated target. */
+export async function readCommittedSharedReminderForTarget(input: {
+  targetAgentId: string;
+  taskId: string;
+}): Promise<ScheduledTask | null> {
+  const [{ dbRead }, { sql }] = await Promise.all([
+    import("../../../db/client"),
+    import("drizzle-orm"),
+  ]);
+  const rows = extractRows(
+    await dbRead.execute(sql`
+      SELECT *
+        FROM app_scheduling.life_scheduled_tasks
+       WHERE id = ${input.taskId}
+         AND transfer_target_agent_id = ${input.targetAgentId}
+         AND transfer_status = 'committed'
+       LIMIT 1
+    `),
+  );
+  return rows[0] ? parseScheduledTaskRow(rows[0]) : null;
+}
+
 /**
  * Reserve every reminder that can still fire for one exact tier cutover. The
  * row-level marker is also checked by the scheduler's atomic fire claim, so a
@@ -79,51 +105,113 @@ export async function reserveSharedRemindersForCutover(input: {
   sourceAgentId: string;
   targetAgentId: string;
   token: string;
+  holderToken: string;
+  authoritative?: boolean;
 }): Promise<ScheduledTask[]> {
+  const [{ dbWrite }, { sql }] = await Promise.all([
+    import("../../../db/client"),
+    import("drizzle-orm"),
+  ]);
+  const now = new Date();
+  const leaseCutoff = new Date(now.getTime() - SHARED_REMINDER_RESERVATION_LEASE_MS).toISOString();
+  return dbWrite.transaction(async (tx) => {
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtext(${`shared-reminder-cutover:${input.sourceAgentId}`}))`,
+    );
+    const conflicting = extractRows(
+      await tx.execute(sql`
+        SELECT transfer_holder_token
+          FROM app_scheduling.life_scheduled_tasks
+         WHERE agent_id = ${input.sourceAgentId}
+           AND transfer_status = 'reserved'
+           AND updated_at::timestamptz >= ${leaseCutoff}::timestamptz
+           AND (
+             transfer_token IS DISTINCT FROM ${input.token}
+             OR transfer_target_agent_id IS DISTINCT FROM ${input.targetAgentId}
+             OR transfer_holder_token IS DISTINCT FROM ${input.holderToken}
+           )
+         LIMIT 1
+      `),
+    );
+    if (conflicting[0] && input.authoritative !== true) {
+      throw new SharedReminderCutoverConflictError(String(conflicting[0].transfer_holder_token));
+    }
+    await tx.execute(sql`
+      UPDATE app_scheduling.life_scheduled_tasks
+         SET transfer_token = ${input.token},
+             transfer_holder_token = ${input.holderToken},
+             transfer_target_agent_id = ${input.targetAgentId},
+             transfer_status = 'reserved',
+             updated_at = ${now.toISOString()},
+             version = version + 1
+       WHERE agent_id = ${input.sourceAgentId}
+         AND kind = 'reminder'
+         AND (
+           next_fire_at IS NOT NULL
+           OR (state_json::jsonb ->> 'status') IN ('scheduled', 'fired', 'acknowledged')
+         )
+         AND (
+           transfer_status IS NULL
+           OR (
+             transfer_status = 'reserved'
+             AND updated_at::timestamptz < ${leaseCutoff}::timestamptz
+           )
+           OR (
+             transfer_status = 'reserved'
+             AND transfer_token = ${input.token}
+             AND transfer_holder_token = ${input.holderToken}
+             AND transfer_target_agent_id = ${input.targetAgentId}
+           )
+           OR (
+             ${input.authoritative === true}
+             AND transfer_status = 'reserved'
+           )
+         )
+    `);
+    const rows = extractRows(
+      await tx.execute(sql`
+        SELECT *
+         FROM app_scheduling.life_scheduled_tasks
+         WHERE agent_id = ${input.sourceAgentId}
+           AND transfer_status IN ('reserved', 'committed')
+           AND transfer_token = ${input.token}
+           AND (
+             transfer_status = 'committed'
+             OR transfer_holder_token = ${input.holderToken}
+           )
+           AND transfer_target_agent_id = ${input.targetAgentId}
+         ORDER BY created_at ASC, id ASC
+      `),
+    );
+    return rows.map(parseScheduledTaskRow);
+  });
+}
+
+/** Releases only the reservation owned by one failed pre-commit attempt. */
+export async function releaseSharedReminderCutover(input: {
+  sourceAgentId: string;
+  targetAgentId: string;
+  token: string;
+  holderToken: string;
+}): Promise<void> {
   const [{ dbWrite }, { sql }] = await Promise.all([
     import("../../../db/client"),
     import("drizzle-orm"),
   ]);
   await dbWrite.execute(sql`
     UPDATE app_scheduling.life_scheduled_tasks
-       SET transfer_token = ${input.token},
-           transfer_target_agent_id = ${input.targetAgentId},
-           transfer_status = 'reserved',
+       SET transfer_token = NULL,
+           transfer_holder_token = NULL,
+           transfer_target_agent_id = NULL,
+           transfer_status = NULL,
            updated_at = ${new Date().toISOString()},
            version = version + 1
      WHERE agent_id = ${input.sourceAgentId}
-       AND kind = 'reminder'
-       AND (
-         next_fire_at IS NOT NULL
-         OR (state_json::jsonb ->> 'status') IN ('scheduled', 'fired', 'acknowledged')
-       )
-       AND transfer_status IS NULL
+       AND transfer_token = ${input.token}
+       AND transfer_holder_token = ${input.holderToken}
+       AND transfer_target_agent_id = ${input.targetAgentId}
+       AND transfer_status = 'reserved'
   `);
-  const conflicting = extractRows(
-    await dbWrite.execute(sql`
-      SELECT transfer_token
-        FROM app_scheduling.life_scheduled_tasks
-       WHERE agent_id = ${input.sourceAgentId}
-         AND transfer_status = 'reserved'
-         AND transfer_token <> ${input.token}
-       LIMIT 1
-    `),
-  );
-  if (conflicting[0]) {
-    throw new SharedReminderCutoverConflictError(String(conflicting[0].transfer_token));
-  }
-  const rows = extractRows(
-    await dbWrite.execute(sql`
-      SELECT *
-       FROM app_scheduling.life_scheduled_tasks
-       WHERE agent_id = ${input.sourceAgentId}
-         AND transfer_status IN ('reserved', 'committed')
-         AND transfer_token = ${input.token}
-         AND transfer_target_agent_id = ${input.targetAgentId}
-       ORDER BY created_at ASC, id ASC
-    `),
-  );
-  return rows.map(parseScheduledTaskRow);
 }
 
 /**
@@ -135,6 +223,7 @@ export async function commitSharedReminderCutover(input: {
   sourceAgentId: string;
   targetAgentId: string;
   token: string;
+  holderToken: string;
   expectedTaskCount: number;
 }): Promise<void> {
   const [{ dbWrite }, { sql }] = await Promise.all([
@@ -148,6 +237,7 @@ export async function commitSharedReminderCutover(input: {
            version = version + 1
      WHERE agent_id = ${input.sourceAgentId}
        AND transfer_token = ${input.token}
+       AND transfer_holder_token = ${input.holderToken}
        AND transfer_target_agent_id = ${input.targetAgentId}
        AND transfer_status = 'reserved'
   `);

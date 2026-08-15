@@ -8,6 +8,7 @@
 
 import { execFile } from "node:child_process";
 import { existsSync, type FSWatcher, mkdirSync, watch } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -861,8 +862,14 @@ export async function buildBrowser(
 /**
  * Build for edge runtimes (Vercel Edge, Cloudflare Workers, Deno Deploy)
  */
+type EdgeBundleIo = {
+	readFile: (path: string, encoding: "utf8") => Promise<string>;
+	writeFile: (path: string, contents: string) => Promise<unknown>;
+};
+
 export async function buildEdge(
 	runnerFactory: typeof createBuildRunner = createBuildRunner,
+	edgeBundleIo?: EdgeBundleIo,
 ) {
 	console.log("⚡ Building for Edge...");
 	const startTime = Date.now();
@@ -906,7 +913,7 @@ export async function buildEdge(
 	// `createRequire(import.meta.url)` gets the same guard: workerd rejects
 	// non-file module URLs, and every __require target left in this bundle is
 	// a builtin.
-	const fsp = await import("node:fs/promises");
+	const fsp = edgeBundleIo ?? (await import("node:fs/promises"));
 	const edgeBundlePath = "dist/edge/index.edge.js";
 	let edgeBundle = await fsp.readFile(edgeBundlePath, "utf8");
 	const shimLine =
@@ -1055,6 +1062,7 @@ export async function buildAll(
 	options: {
 		runnerFactory?: typeof createBuildRunner;
 		generateDeclarations?: () => Promise<void>;
+		edgeBundleIo?: EdgeBundleIo;
 	} = {},
 ) {
 	console.log("🚀 Starting dual build process for @elizaos/core");
@@ -1067,7 +1075,7 @@ export async function buildAll(
 	await Promise.all([
 		buildNode(runnerFactory),
 		buildBrowser(runnerFactory),
-		buildEdge(runnerFactory),
+		buildEdge(runnerFactory, options.edgeBundleIo),
 		buildTesting(runnerFactory),
 	]);
 
@@ -1309,9 +1317,89 @@ export async function generateTypeScriptDeclarations() {
 	console.log(`✅ TypeScript declarations generated in ${duration}s`);
 }
 
+async function verifyPackedEdgeContract(): Promise<void> {
+	const fs = await import("node:fs/promises");
+	const contractRoot = await fs.mkdtemp(
+		join(tmpdir(), "eliza-core-edge-package-"),
+	);
+	try {
+		const { stdout } = await execFileAsync(
+			"npm",
+			["pack", "--json", "--pack-destination", contractRoot, process.cwd()],
+			{ cwd: process.cwd(), maxBuffer: 10 * 1024 * 1024 },
+		);
+		const packed = JSON.parse(stdout) as Array<{ filename?: unknown }>;
+		const filename = packed[0]?.filename;
+		if (typeof filename !== "string") {
+			throw new Error("npm pack did not report the @elizaos/core tarball");
+		}
+
+		const packageRoot = join(contractRoot, "node_modules", "@elizaos", "core");
+		await fs.mkdir(packageRoot, { recursive: true });
+		await execFileAsync(
+			"tar",
+			[
+				"-xzf",
+				join(contractRoot, filename),
+				"-C",
+				packageRoot,
+				"--strip-components=1",
+			],
+			{ cwd: process.cwd() },
+		);
+
+		await fs.writeFile(
+			join(contractRoot, "consumer.mts"),
+			[
+				'import { basicActions, basicCapabilities, createBasicCapabilitiesPlugin, isEdge, type Plugin } from "@elizaos/core/edge";',
+				"const plugin: Plugin = createBasicCapabilitiesPlugin();",
+				"void basicActions; void basicCapabilities; void isEdge; void plugin;",
+				"",
+			].join("\n"),
+		);
+		await execFileAsync(
+			resolveTscBin(),
+			[
+				"--noEmit",
+				"--module",
+				"NodeNext",
+				"--moduleResolution",
+				"NodeNext",
+				"--target",
+				"ES2022",
+				"--skipLibCheck",
+				"consumer.mts",
+			],
+			{ cwd: contractRoot },
+		);
+
+		await fs.writeFile(
+			join(contractRoot, "consumer.mjs"),
+			[
+				'import * as edge from "@elizaos/core/edge";',
+				'if (edge.isEdge !== true) throw new Error("packed edge marker is missing");',
+				'if (!Array.isArray(edge.basicActions) || typeof edge.createBasicCapabilitiesPlugin !== "function") throw new Error("packed basic capability runtime is missing");',
+				'if ("advancedCapabilities" in edge || "pluginManager" in edge) throw new Error("packed edge runtime exposes a host-only capability");',
+				"",
+			].join("\n"),
+		);
+		await execFileAsync(process.execPath, ["consumer.mjs"], {
+			cwd: contractRoot,
+		});
+		console.log(
+			"✅ Packed @elizaos/core/edge declarations and runtime import verified",
+		);
+	} finally {
+		await execFileAsync("node", [RM_RECURSIVE_SCRIPT, contractRoot], {
+			cwd: process.cwd(),
+		});
+	}
+}
+
 if (import.meta.main) {
 	const isNodeOnly = process.argv.includes("--node-only");
 	const isEdgeOnly = process.argv.includes("--edge-only");
+	const isWatch = process.argv.includes("--watch");
 	if (isNodeOnly && isEdgeOnly) {
 		throw new Error("Choose either --node-only or --edge-only, not both");
 	}
@@ -1320,6 +1408,7 @@ if (import.meta.main) {
 	withCoreBuildLock(async () => {
 		await execFileAsync("node", [CLEAN_SRC_ARTIFACTS_SCRIPT]);
 		await build();
+		if (!isNodeOnly && !isWatch) await verifyPackedEdgeContract();
 		await execFileAsync("node", [CLEAN_SRC_ARTIFACTS_SCRIPT, "--check"]);
 	}).catch((error) => {
 		console.error("Build script error:", error);

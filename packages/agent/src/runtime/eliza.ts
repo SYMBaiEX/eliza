@@ -181,11 +181,7 @@ import {
 import { buildDefaultElizaCloudServiceRouting } from "@elizaos/shared/contracts/service-routing";
 import { resolveDefaultVaultDataDir } from "@elizaos/vault";
 import { registerDesktopScreenCaptureBridgeService } from "./desktop-screen-capture-bridge-service.ts";
-import {
-  type AgentHostBridge,
-  getAgentHostBridge,
-  hasDurableHostVault,
-} from "./host-bridge.ts";
+import { type AgentHostBridge, getAgentHostBridge } from "./host-bridge.ts";
 
 // Host capabilities (wallet-key hydration, vault bootstrap/access, account
 // pool, build variant) are INJECTED downward by the app-core host via
@@ -2269,8 +2265,19 @@ export function applyCloudConfigToEnv(config: ElizaConfig): void {
   // Cloud inference is selected from the canonical first-run connection, not
   // just from raw cloud flags. This keeps linked cloud auth from re-enabling
   // Eliza Cloud after the user has switched to a local or remote provider.
-  const effectivelyEnabled = topology.services.inference || isCloudContainer;
+  const inferenceConfigured = topology.services.inference || isCloudContainer;
   const shouldLoadCloudPlugin = topology.shouldLoadPlugin || isCloudContainer;
+  const configuredCloudApiKey = trimCloudCredential(cloud?.apiKey);
+  const effectiveCloudApiKey =
+    configuredCloudApiKey ??
+    readEffectiveCloudCredential(config, "ELIZAOS_CLOUD_API_KEY");
+  // Declared routing is intent, not proof that the selected handler can serve.
+  // A provisioned Cloud container owns its runtime route; every other host must
+  // have the actual credential that plugin-elizacloud will use before Cloud can
+  // register the high-priority chat-brain handlers.
+  const inferenceAvailable =
+    isCloudContainer ||
+    (topology.services.inference && Boolean(effectiveCloudApiKey));
 
   const setCloudUsageEnv = (key: string, enabled: boolean): void => {
     if (enabled) {
@@ -2283,7 +2290,7 @@ export function applyCloudConfigToEnv(config: ElizaConfig): void {
   if (isElizaSettingsDebugEnabled()) {
     const c = (cloud ?? {}) as Record<string, unknown>;
     logger.debug(
-      `[eliza][settings][runtime] applyCloudConfigToEnv inference=${effectivelyEnabled} shouldLoadPlugin=${shouldLoadCloudPlugin} isCloudContainer=${isCloudContainer} cloud=${JSON.stringify(settingsDebugCloudSummary(c))}`,
+      `[eliza][settings][runtime] applyCloudConfigToEnv inferenceConfigured=${inferenceConfigured} inferenceAvailable=${inferenceAvailable} shouldLoadPlugin=${shouldLoadCloudPlugin} isCloudContainer=${isCloudContainer} cloud=${JSON.stringify(settingsDebugCloudSummary(c))}`,
     );
   }
 
@@ -2296,12 +2303,22 @@ export function applyCloudConfigToEnv(config: ElizaConfig): void {
   // when inference is off (the old behavior) was indistinguishable from "no
   // policy", so the plugin could never load capability-only — the host nuked
   // the API key instead and lost image generation as collateral (#10819).
-  if (effectivelyEnabled) {
+  if (inferenceAvailable) {
     process.env.ELIZAOS_CLOUD_USE_INFERENCE = "true";
   } else if (shouldLoadCloudPlugin) {
     process.env.ELIZAOS_CLOUD_USE_INFERENCE = "false";
   } else {
     delete process.env.ELIZAOS_CLOUD_USE_INFERENCE;
+  }
+  // Config declares "route this to Cloud"; handler registration silently
+  // requires a credential. When they disagree the runtime falls through to
+  // another provider and, before this, left no trace — the user saw Cloud
+  // selected in config while local answered every turn (#20045 R3/R4).
+  if (topology.servicesUnreconciled.length > 0) {
+    logger.warn(
+      { services: topology.servicesUnreconciled },
+      `[eliza][cloud] Config routes ${topology.servicesUnreconciled.join(", ")} to Eliza Cloud, but no Cloud credential is linked. Those capabilities fall back to their local/other providers until you sign in.`,
+    );
   }
   setCloudUsageEnv(
     "ELIZAOS_CLOUD_USE_TTS",
@@ -2356,17 +2373,13 @@ export function applyCloudConfigToEnv(config: ElizaConfig): void {
   }
   setCloudUsageEnv("ELIZAOS_CLOUD_USE_RPC", topology.services.rpc);
 
-  if (effectivelyEnabled) {
+  if (inferenceConfigured) {
     process.env.ELIZAOS_CLOUD_ENABLED = "true";
   } else {
     delete process.env.ELIZAOS_CLOUD_ENABLED;
   }
 
   if (shouldLoadCloudPlugin) {
-    const configuredCloudApiKey = trimCloudCredential(cloud?.apiKey);
-    const effectiveCloudApiKey =
-      configuredCloudApiKey ??
-      readEffectiveCloudCredential(config, "ELIZAOS_CLOUD_API_KEY");
     const configuredCloudBaseUrl = trimEnvString(cloud?.baseUrl);
     const effectiveCloudBaseUrl =
       configuredCloudBaseUrl ??
@@ -2446,7 +2459,7 @@ export function applyCloudConfigToEnv(config: ElizaConfig): void {
         mega?: string;
       }
     | undefined;
-  if (effectivelyEnabled) {
+  if (inferenceAvailable) {
     const nano =
       llmText?.nanoModel ||
       models?.nano ||
@@ -4882,19 +4895,14 @@ export async function startEliza(
 
   // Durable storage for connector OAuth credential refs. Connector plugins
   // resolve `connector_credential_store` for BOTH the write at OAuth-callback
-  // time and the read after restart; without this service their token writes
-  // fall through to the in-memory SECRETS global store and die with the
-  // process (the dangling vaultRef then fails every post-restart credential
-  // read). Registered only when the host vault is real — wrapping the no-op
-  // default vault would swallow writes instead.
+  // time and the read after restart; before this service existed their token
+  // writes fell through to the in-memory SECRETS global store and died with
+  // the process (the dangling vaultRef then failed every post-restart
+  // credential read — #18080). Registered unconditionally: the service uses
+  // the host vault when a durable bridge is installed and opens its own
+  // state-dir PGlite vault on hostless/standalone/Cloud boots.
   const registerConnectorCredentialStoreService = async (): Promise<void> => {
     try {
-      if (!hasDurableHostVault()) {
-        logger.debug(
-          "[eliza] ConnectorCredentialStoreService skipped: no durable host vault",
-        );
-        return;
-      }
       const { ConnectorCredentialStoreService } = await import(
         "../services/connector-credential-store.ts"
       );
@@ -4916,12 +4924,11 @@ export async function startEliza(
   // surface a failure loudly — a missing store is exactly the silent-token-
   // loss condition this service exists to prevent.
   const ensureConnectorCredentialStoreStarted = async (): Promise<void> => {
-    if (!hasDurableHostVault()) return;
     try {
       await runtime.getServiceLoadPromise("connector_credential_store");
     } catch (err) {
       logger.warn(
-        `[eliza] ConnectorCredentialStoreService failed to start; connector OAuth credential writes will fall back to non-durable storage: ${formatError(err)}`,
+        `[eliza] ConnectorCredentialStoreService failed to start; connector OAuth credential writes will fail until it is restored (no non-durable fallback): ${formatError(err)}`,
       );
     }
   };
@@ -5861,6 +5868,12 @@ export async function startEliza(
         });
       }
     }
+    if (isProvisionedCloudContainer()) {
+      const { registerSharedCutoverReminderDispatcher } = await import(
+        "./shared-cutover-reminder-dispatch.ts"
+      );
+      registerSharedCutoverReminderDispatcher(runtime);
+    }
     abortSignal.throwIfAborted();
     await installServerSideWebSearchIfAvailable();
     abortSignal.throwIfAborted();
@@ -6115,13 +6128,20 @@ export async function startEliza(
     // access, e2e harnesses). Every non-local boot leaves localAgentMode unset,
     // so skipApiListen is false and the port binds exactly as before.
     const skipApiListen = !bootPlan.bindApiListener;
+    let disposedRuntimeBeforeReplacement = false;
     const { port: actualApiPort } = await startApiServer({
       port: apiPort,
       runtime,
       skipListen: skipApiListen,
-      onRestart: async () => {
+      onRestart: async (restartOptions) => {
         logger.info("[eliza] Hot-reload: building replacement runtime...");
         try {
+          if (restartOptions?.disposeCurrentBeforeBuild) {
+            await shutdownRuntime(runtime, "pre-restore runtime disposal", {
+              fast: true,
+            });
+            disposedRuntimeBeforeReplacement = true;
+          }
           const replacement = await buildInitializedRuntime({
             config: loadElizaConfig(),
             localAgentMode: opts?.localAgentMode,
@@ -6137,6 +6157,10 @@ export async function startEliza(
       onRuntimeActivated: async (previousRuntime, activeRuntime) => {
         runtime = activeRuntime;
         if (!previousRuntime || previousRuntime === activeRuntime) {
+          return;
+        }
+        if (disposedRuntimeBeforeReplacement) {
+          disposedRuntimeBeforeReplacement = false;
           return;
         }
         try {

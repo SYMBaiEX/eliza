@@ -996,6 +996,15 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
       is_active: true,
     };
     const convergenceToken = `phone-telegram:source:${USER_C}`;
+    const { createSharedTodoStore, sharedTodoStorageScope } = await import(
+      "@/lib/services/shared-runtime/shared-todos"
+    );
+    const cutoverTodoStore = createSharedTodoStore();
+    const cutoverTodoScope = sharedTodoStorageScope({
+      sourceAgentId: PERSONAL_C,
+      ownerId: USER_C,
+    });
+    let cutoverTodoId: string | null = null;
 
     try {
       cutoverCoordinatorOperations.length = 0;
@@ -1059,6 +1068,25 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
           '2026-08-14T17:00:00.000Z'
         )
       `);
+      const cutoverTodoMutation = await cutoverTodoStore.applyMutation({
+        scope: cutoverTodoScope,
+        idempotencyKey: "cutover-api-test:create",
+        mutation: {
+          action: "create",
+          input: {
+            roomId: "a5150000-0000-4000-8000-000000000002",
+            content: "Call mom before Friday",
+            activeForm: "Calling mom before Friday",
+            status: "pending",
+            metadata: { source: "cutover-api-test" },
+          },
+        },
+      });
+      if (cutoverTodoMutation.result.action !== "create") {
+        throw new Error("Todo setup did not return its created row");
+      }
+      const cutoverTodo = cutoverTodoMutation.result.todo;
+      cutoverTodoId = cutoverTodo.id;
 
       const refused = await cutover(PERSONAL_C, CUTOVER_TARGET);
       expect(refused.status).toBe(503);
@@ -1077,35 +1105,128 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
         "cutover-seal",
         "cutover-release",
       ]);
-      const reservedRows = (await dbWrite.execute(sql`
+      const releasedRows = (await dbWrite.execute(sql`
         SELECT id, transfer_status
           FROM app_scheduling.life_scheduled_tasks
          WHERE id IN ('cutover-inflight', 'cutover-reminder')
          ORDER BY id
-      `)) as { rows: Array<{ id: string; transfer_status: string }> };
-      expect(reservedRows.rows).toEqual([
-        { id: "cutover-inflight", transfer_status: "reserved" },
-        { id: "cutover-reminder", transfer_status: "reserved" },
+      `)) as {
+        rows: Array<{ id: string; transfer_status: string | null }>;
+      };
+      expect(releasedRows.rows).toEqual([
+        { id: "cutover-inflight", transfer_status: null },
+        { id: "cutover-reminder", transfer_status: null },
+      ]);
+
+      await dbWrite.execute(sql`
+        UPDATE app_scheduling.life_scheduled_tasks
+           SET transfer_token = ${`personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`},
+               transfer_holder_token = NULL,
+               transfer_target_agent_id = ${CUTOVER_TARGET},
+               transfer_status = 'reserved',
+               updated_at = NOW()
+         WHERE id IN ('cutover-inflight', 'cutover-reminder')
+      `);
+      const competing = await cutover(PERSONAL_C, CUTOVER_TARGET);
+      const competingBody = await competing.json();
+      expect(competingBody).toMatchObject({
+        code: "personal_reminder_cutover_in_progress",
+      });
+      expect(competing.status).toBe(423);
+      const competingRows = (await dbWrite.execute(sql`
+        SELECT DISTINCT transfer_token, transfer_holder_token, transfer_target_agent_id
+          FROM app_scheduling.life_scheduled_tasks
+         WHERE id IN ('cutover-inflight', 'cutover-reminder')
+      `)) as {
+        rows: Array<{
+          transfer_token: string;
+          transfer_holder_token: string | null;
+          transfer_target_agent_id: string;
+        }>;
+      };
+      expect(competingRows.rows).toEqual([
+        {
+          transfer_token: `personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`,
+          transfer_holder_token: null,
+          transfer_target_agent_id: CUTOVER_TARGET,
+        },
+      ]);
+      await dbWrite.execute(sql`
+        UPDATE app_scheduling.life_scheduled_tasks
+           SET updated_at = '2000-01-01T00:00:00.000Z'
+         WHERE id IN ('cutover-inflight', 'cutover-reminder')
+      `);
+
+      importFetch.mockImplementation(async () =>
+        Response.json({
+          complete: true,
+          sourceMessageCount: cutoverHistory.length,
+          inserted: cutoverHistory.length,
+          skipped: 0,
+          sourceScheduledTaskCount: 2,
+          importedScheduledTasks: 2,
+          skippedScheduledTasks: 0,
+          activatedScheduledTasks: 0,
+          skippedActivatedScheduledTasks: 0,
+        }),
+      );
+      cutoverCoordinatorOperations.length = 0;
+      const missingTodoReceipt = await cutover(PERSONAL_C, CUTOVER_TARGET);
+      expect(missingTodoReceipt.status).toBe(503);
+      expect(await missingTodoReceipt.json()).toMatchObject({
+        code: "dedicated_history_receipt_invalid",
+      });
+      const [withoutTodoReceipt] = await dbWrite
+        .select()
+        .from(agentSandboxes)
+        .where(eq(agentSandboxes.id, CUTOVER_TARGET));
+      expect(
+        (withoutTodoReceipt?.agent_config as Record<string, unknown> | null)
+          ?.__agentPersonalCutover,
+        "a message/reminder receipt cannot flip the route without Todo proof",
+      ).toBeUndefined();
+      expect(cutoverCoordinatorOperations).toEqual([
+        "cutover-seal",
+        "cutover-release",
       ]);
 
       importFetch.mockImplementation(async (_input, init) => {
         const requestBody = JSON.parse(String(init?.body)) as {
           activateScheduledTasks?: boolean;
+          messages: unknown[];
+          todoSnapshot: {
+            todos: unknown[];
+            mutations: unknown[];
+            digest: string;
+          };
         };
+        const messageCount = requestBody.messages.length;
+        const todoCount = requestBody.todoSnapshot.todos.length;
+        const todoMutationCount = requestBody.todoSnapshot.mutations.length;
         return Response.json({
           complete: true,
-          sourceMessageCount: cutoverHistory.length,
-          inserted: requestBody.activateScheduledTasks
-            ? 0
-            : cutoverHistory.length,
-          skipped: requestBody.activateScheduledTasks
-            ? cutoverHistory.length
-            : 0,
+          sourceMessageCount: messageCount,
+          inserted: requestBody.activateScheduledTasks ? 0 : messageCount,
+          skipped: requestBody.activateScheduledTasks ? messageCount : 0,
           sourceScheduledTaskCount: 2,
           importedScheduledTasks: requestBody.activateScheduledTasks ? 0 : 2,
           skippedScheduledTasks: requestBody.activateScheduledTasks ? 2 : 0,
           activatedScheduledTasks: requestBody.activateScheduledTasks ? 2 : 0,
           skippedActivatedScheduledTasks: 0,
+          sourceTodoCount: todoCount,
+          importedTodos: requestBody.activateScheduledTasks ? 0 : todoCount,
+          repairedTodos: 0,
+          skippedTodos: requestBody.activateScheduledTasks ? todoCount : 0,
+          removedStaleTodos: 0,
+          sourceTodoMutationCount: todoMutationCount,
+          importedTodoMutations: requestBody.activateScheduledTasks
+            ? 0
+            : todoMutationCount,
+          skippedTodoMutations: requestBody.activateScheduledTasks
+            ? todoMutationCount
+            : 0,
+          sourceTodoDigest: requestBody.todoSnapshot.digest,
+          targetTodoDigest: requestBody.todoSnapshot.digest,
         });
       });
       cutoverCommitFailuresRemaining = 1;
@@ -1125,6 +1246,9 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
         sourceAgentId: PERSONAL_C,
         cutoverToken: `personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`,
         sharedMessageCount: 2,
+        sharedTodoCount: 1,
+        sharedTodoMutationCount: 1,
+        sharedTodoDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
       expect(cutoverCoordinatorOperations).toEqual([
         "cutover-seal",
@@ -1134,6 +1258,9 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
         sourceAgentId: PERSONAL_C,
         cutoverToken: `personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`,
         sharedMessageCount: 2,
+        sharedTodoCount: 1,
+        sharedTodoMutationCount: 1,
+        sharedTodoDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
 
       markerObservedAtCommit = undefined;
@@ -1149,6 +1276,8 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
           apiBase: `https://${CUTOVER_TARGET}.dedicated-cutover.test`,
           importedMessages: 2,
           importedScheduledTasks: 2,
+          importedTodos: 1,
+          importedTodoMutations: 1,
         },
       });
       expect(importFetch).toHaveBeenLastCalledWith(
@@ -1182,15 +1311,44 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
             kind: "reminder",
             promptInstructions: "drink water",
             state: { status: "fired", followupCount: 0 },
+            escalation: {
+              steps: [{ delayMinutes: 0, channelKey: "shared_gateway_dm" }],
+            },
           },
           {
             taskId: "cutover-reminder",
             kind: "reminder",
             promptInstructions: "call mom",
             state: { status: "scheduled", followupCount: 0 },
+            escalation: {
+              steps: [{ delayMinutes: 0, channelKey: "shared_gateway_dm" }],
+            },
           },
         ],
         cutoverToken: `personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`,
+        todoSnapshot: {
+          version: 2,
+          sourceAgentId: PERSONAL_C,
+          todos: [
+            {
+              sourceId: cutoverTodo.id,
+              roomId: "a5150000-0000-4000-8000-000000000002",
+              content: "Call mom before Friday",
+              activeForm: "Calling mom before Friday",
+              status: "pending",
+              metadata: { source: "cutover-api-test" },
+            },
+          ],
+          mutations: [
+            expect.objectContaining({
+              version: 1,
+              idempotencyKey: "cutover-api-test:create",
+              operation: "create",
+              applied: true,
+            }),
+          ],
+          digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
       });
       const activationInit = importFetch.mock.calls.at(-1)?.[1] as
         | RequestInit
@@ -1199,6 +1357,17 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
         messages: [],
         activateScheduledTasks: true,
         cutoverToken: `personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`,
+        todoSnapshot: {
+          version: 2,
+          sourceAgentId: PERSONAL_C,
+          todos: [{ sourceId: cutoverTodo.id }],
+          mutations: [
+            expect.objectContaining({
+              idempotencyKey: "cutover-api-test:create",
+            }),
+          ],
+          digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
       });
       expect(cutoverCoordinatorOperations).toEqual(["cutover-commit"]);
       expect(markerObservedAtCommit).toMatchObject({
@@ -1206,6 +1375,9 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
         cutoverToken: `personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`,
         sharedMessageCount: 2,
         sharedScheduledTaskCount: 2,
+        sharedTodoCount: 1,
+        sharedTodoMutationCount: 1,
+        sharedTodoDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
       expect(new Set(cutoverCoordinatorTokens).size).toBe(1);
 
@@ -1220,6 +1392,9 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
             cutoverToken?: string;
             sharedMessageCount?: number;
             sharedScheduledTaskCount?: number;
+            sharedTodoCount?: number;
+            sharedTodoMutationCount?: number;
+            sharedTodoDigest?: string;
             activatedAt?: string;
           }
         | undefined;
@@ -1228,6 +1403,9 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
         cutoverToken: `personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`,
         sharedMessageCount: 2,
         sharedScheduledTaskCount: 2,
+        sharedTodoCount: 1,
+        sharedTodoMutationCount: 1,
+        sharedTodoDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
       expect(marker?.activatedAt).toBeTruthy();
 
@@ -1235,7 +1413,7 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
       const retried = await cutover(PERSONAL_C, CUTOVER_TARGET);
       expect(retried.status).toBe(200);
       expect(cutoverCoordinatorOperations).toEqual(["cutover-commit"]);
-      expect(importFetch).toHaveBeenCalledTimes(4);
+      expect(importFetch).toHaveBeenCalledTimes(5);
       const [afterRetry] = await dbWrite
         .select()
         .from(agentSandboxes)
@@ -1258,12 +1436,21 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
       importFetch.mockImplementation(async (_input, init) => {
         const requestBody = JSON.parse(String(init?.body)) as {
           activateScheduledTasks?: boolean;
+          messages: unknown[];
+          todoSnapshot: {
+            todos: unknown[];
+            mutations: unknown[];
+            digest: string;
+          };
         };
+        const messageCount = requestBody.messages.length;
+        const todoCount = requestBody.todoSnapshot.todos.length;
+        const todoMutationCount = requestBody.todoSnapshot.mutations.length;
         return Response.json({
           complete: true,
-          sourceMessageCount: cutoverHistory.length,
+          sourceMessageCount: messageCount,
           inserted: 0,
-          skipped: cutoverHistory.length,
+          skipped: messageCount,
           sourceScheduledTaskCount: 2,
           importedScheduledTasks: 0,
           skippedScheduledTasks: 2,
@@ -1271,6 +1458,16 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
           skippedActivatedScheduledTasks: requestBody.activateScheduledTasks
             ? 2
             : 0,
+          sourceTodoCount: todoCount,
+          importedTodos: 0,
+          repairedTodos: 0,
+          skippedTodos: todoCount,
+          removedStaleTodos: 0,
+          sourceTodoMutationCount: todoMutationCount,
+          importedTodoMutations: 0,
+          skippedTodoMutations: todoMutationCount,
+          sourceTodoDigest: requestBody.todoSnapshot.digest,
+          targetTodoDigest: requestBody.todoSnapshot.digest,
         });
       });
       cutoverCoordinatorOperations.length = 0;
@@ -1292,6 +1489,9 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
         cutoverToken: `personal-cutover:${PERSONAL_C}:${CUTOVER_TARGET}`,
         sharedMessageCount: cutoverHistory.length,
         sharedScheduledTaskCount: 2,
+        sharedTodoCount: 1,
+        sharedTodoMutationCount: 1,
+        sharedTodoDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
       const committedRows = (await dbWrite.execute(sql`
         SELECT id, transfer_status
@@ -1320,6 +1520,9 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
         ),
       ).toBe(false);
     } finally {
+      if (cutoverTodoId) {
+        await cutoverTodoStore.delete(cutoverTodoScope, cutoverTodoId);
+      }
       await dbWrite
         .delete(personalAccountConvergences)
         .where(eq(personalAccountConvergences.token, convergenceToken));

@@ -252,7 +252,7 @@ export function createSchedulingSqlScheduledTaskStore(
           ${sqlQuote(now)},
           ${sqlQuote(now)}
         )
-        ON CONFLICT (id) DO UPDATE SET
+        ON CONFLICT (agent_id, id) DO UPDATE SET
           kind = EXCLUDED.kind,
           prompt_instructions = EXCLUDED.prompt_instructions,
           context_request_json = EXCLUDED.context_request_json,
@@ -274,7 +274,8 @@ export function createSchedulingSqlScheduledTaskStore(
           metadata_json = EXCLUDED.metadata_json,
           execution_profile = EXCLUDED.execution_profile,
           next_fire_at = EXCLUDED.next_fire_at,
-          updated_at = ${sqlQuote(now)}`,
+          updated_at = ${sqlQuote(now)}
+        WHERE ${TASK_TABLE}.transfer_status IS NULL`,
       );
     },
     async claimForFire(args: {

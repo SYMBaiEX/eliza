@@ -14,6 +14,8 @@ export interface ChatEvent {
   senderName?: string;
   text: string;
   isCommand?: boolean;
+  /** Provider-accepted message time, used only for coarse ingress latency. */
+  providerSentAtMs?: number;
   mediaUrls?: string[];
   /** Provider-owned voice-note metadata; never contains an authenticated URL. */
   voiceNote?: {
@@ -44,12 +46,21 @@ export interface PlatformAdapter {
     event: ChatEvent,
     text: string,
   ): Promise<void>;
+  sendReplyWithReceipt?(
+    config: WebhookConfig,
+    event: ChatEvent,
+    text: string,
+  ): Promise<PlatformDeliveryReceipt>;
   sendTypingIndicator(config: WebhookConfig, event: ChatEvent): Promise<void>;
   /** Resolve provider-owned voice bytes while credentials are still local. */
   resolveVoiceNote?(
     config: WebhookConfig,
     event: ChatEvent,
   ): Promise<ResolvedVoiceNote>;
+}
+
+export interface PlatformDeliveryReceipt {
+  providerMessageIds: string[];
 }
 
 export interface ResolvedVoiceNote {
