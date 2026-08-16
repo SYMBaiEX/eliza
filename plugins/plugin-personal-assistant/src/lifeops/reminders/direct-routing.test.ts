@@ -68,6 +68,15 @@ describe("owner reminder direct routing", () => {
     "Remind me to call Pat tomorrow, said Alice.",
     "Remind me to call Pat tomorrow was written on the whiteboard.",
     "Remind me to call Pat tomorrow; disregard that request.",
+    "Remind me along with Alex to call Pat tomorrow.",
+    "Remind me together with Alex to call Pat tomorrow.",
+    "REMIND ME ALONG WITH alex to call Pat tomorrow.",
+    "Remind me to call Pat tomorrow — those were Alice’s exact words.",
+    "Remind me to call Pat tomorrow -- those were Alice's exact words.",
+    "Remind me to call Pat tomorrow appears on the whiteboard.",
+    "Remind me to call Pat tomorrow, actually ignore that request.",
+    "Remind me to call Pat tomorrow, forget it.",
+    "Remind me to call Pat tomorrow is sample syntax.",
   ])("does not claim adjacent or read-only intent: %s", (text) => {
     expect(looksLikeOwnerReminderCreateRequest(text)).toBe(false);
   });
